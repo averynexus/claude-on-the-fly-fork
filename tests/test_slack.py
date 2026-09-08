@@ -621,6 +621,13 @@ class TestNotifyStart:
         frontend._app.client.reactions_add.assert_not_awaited()
         frontend._app.client.reactions_remove.assert_not_awaited()
 
+    async def test_no_pending_is_logged_at_warning(self, frontend, caplog):
+        """A turn that reacts to nothing is the one trace of a dropped :eyes:.
+        At debug it left none, so it could not be told from an API failure."""
+        with caplog.at_level("WARNING", logger="claude_on_the_fly.slack"):
+            await frontend.notify_start(99999)
+        assert "no pending reaction msg for chat_id=99999" in caplog.text
+
 
 class TestNotifyComplete:
     async def test_removes_eyes_from_in_flight(self, frontend):
@@ -4056,16 +4063,20 @@ class TestSuggestionActions:
         assert status["elements"][0]["text"] == "✓ what can you do?"
         frontend._on_message.assert_awaited_once()
 
-    async def test_tap_without_message_blocks_skips_the_mark(self, frontend):
+    async def test_tap_without_message_blocks_skips_the_mark(self, frontend, caplog):
+        """The one path that dropped the ✓ with no trace. The tap still routes,
+        so this log line is the only evidence the menu was never retired."""
         frontend._sessions[_session_key("C1", "t1")] = ("C1", "t1")
         frontend._app.client.chat_update = AsyncMock()
         body = self._tap()
         del body["message"]["blocks"]
 
-        await frontend._on_suggestion_action(body)
+        with caplog.at_level("WARNING", logger="claude_on_the_fly.slack"):
+            await frontend._on_suggestion_action(body)
 
         frontend._app.client.chat_update.assert_not_awaited()
         frontend._on_message.assert_awaited_once()
+        assert "cannot retire suggestion menu, incomplete payload" in caplog.text
 
     async def test_mark_failure_is_logged_and_tap_still_sends(
         self, frontend, caplog

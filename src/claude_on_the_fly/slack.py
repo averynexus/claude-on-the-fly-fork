@@ -1806,6 +1806,16 @@ class SlackFrontend(Frontend):
         ts = message.get("ts", "")
         blocks = message.get("blocks")
         if not (channel and ts and blocks):
+            # The one path that used to drop the ✓ with no trace anywhere. The
+            # tap still routes, so the only evidence a menu was never retired is
+            # this line.
+            logger.warning(
+                "slack: cannot retire suggestion menu, incomplete payload "
+                "(channel=%r ts=%r blocks=%s)",
+                channel,
+                ts,
+                "yes" if blocks else "no",
+            )
             return
         try:
             await self._app.client.chat_update(
@@ -2975,7 +2985,13 @@ class SlackFrontend(Frontend):
         await self._set_status(chat_id, f"is {seq[0]}…")
         pending = self._pending_msg.get(chat_id)
         if not pending:
-            logger.debug(
+            # Warning, not debug: a slash command and the skill picker reach here
+            # with nothing to react to by design, but so does a typed message
+            # whose entry another turn already took. The two are indistinguishable
+            # from here, and only the second one costs somebody their :eyes:. At
+            # debug it left no trace at all, which is what made a dropped
+            # reaction impossible to tell from a Slack API failure.
+            logger.warning(
                 "notify_start: no pending reaction msg for chat_id=%s", chat_id
             )
             return
