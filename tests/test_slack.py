@@ -21,6 +21,7 @@ from claude_on_the_fly.slack import (
     DEFAULT_JOB_COMMAND,
     DEFAULT_REPLY_SOFT_LIMIT,
     JOB_LIST_LIMIT,
+    RATE_LIMIT_RETRIES,
     SlackFrontend,
     _build_response_blocks,
     _render_job_list,
@@ -209,6 +210,18 @@ class TestSlackFrontendInit:
         assert frontend._is_bot_token is True
         _, kwargs = mock_app_cls.call_args
         assert kwargs["ignoring_self_events_enabled"] is True
+
+    def test_rate_limited_calls_are_retried(self):
+        """A real client, because the point is what slack_sdk ships by default:
+        one handler, for connection errors. A 429 is not one, so without this the
+        reaction or the menu edit is dropped and only logged."""
+        frontend = SlackFrontend("xapp-tok", "xoxp-tok", "U_SELF")
+        handlers = {type(h).__name__: h for h in frontend._app.client.retry_handlers}
+        assert "AsyncRateLimitErrorRetryHandler" in handlers
+        assert (
+            handlers["AsyncRateLimitErrorRetryHandler"].max_retry_count
+            == RATE_LIMIT_RETRIES
+        )
 
 
 # ---------------------------------------------------------------------------

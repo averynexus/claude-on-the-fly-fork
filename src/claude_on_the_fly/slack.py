@@ -22,6 +22,9 @@ import aiohttp
 from slack_bolt.adapter.socket_mode.async_handler import AsyncSocketModeHandler
 from slack_bolt.async_app import AsyncApp
 from slack_sdk.errors import SlackApiError
+from slack_sdk.http_retry.builtin_async_handlers import (
+    AsyncRateLimitErrorRetryHandler,
+)
 from slack_sdk.web.async_slack_response import AsyncSlackResponse
 
 from claude_on_the_fly import checks, logs, settings
@@ -395,6 +398,11 @@ SPINNER_VERBS = (
 # least-recently-active thread is evicted; it re-hydrates from scratch if it
 # ever sees another message. Bounds memory in a long-running daemon.
 DEFAULT_SESSION_CAP = 1000
+# Retries a rate-limited Slack call gets before it gives up. Slack's own
+# Retry-After sets the wait, so this bounds how long one call may block the
+# turn's setup rather than how long it sleeps. Three covers the burst a queue of
+# turns produces; a limit that outlasts three backoffs is an outage, not a burst.
+RATE_LIMIT_RETRIES = 3
 # Seconds of elapsed time between spinner-verb changes. The order is shuffled
 # once per turn (at message-in); ticks just index into it by elapsed time.
 STATUS_VERB_ROTATE_SECS = 4
@@ -1131,6 +1139,15 @@ class SlackFrontend(Frontend):
         self._is_bot_token = token.startswith("xoxb-")
         self._app = AsyncApp(
             token=token, ignoring_self_events_enabled=self._is_bot_token
+        )
+        # slack_sdk ships one default handler, for connection errors. A 429 is
+        # not one: without this, a rate-limited reactions.add or chat_update
+        # raises, gets logged, and the mark simply never appears -- a dropped
+        # :eyes: or a suggestion menu that stays clickable. Both are Tier 3
+        # methods, so a burst of turns can reach the limit. The handler honours
+        # Slack's own Retry-After.
+        self._app.client.retry_handlers.append(
+            AsyncRateLimitErrorRetryHandler(max_retry_count=RATE_LIMIT_RETRIES)
         )
         self._handler: AsyncSocketModeHandler | None = None
         self._on_message: Callable[[int, str], Awaitable[None]] | None = None
