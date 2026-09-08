@@ -21,6 +21,7 @@ from claude_on_the_fly.slack import (
     DEFAULT_JOB_COMMAND,
     DEFAULT_REPLY_SOFT_LIMIT,
     JOB_LIST_LIMIT,
+    RATE_LIMIT_RETRIES,
     SlackFrontend,
     _build_response_blocks,
     _render_job_list,
@@ -209,6 +210,18 @@ class TestSlackFrontendInit:
         assert frontend._is_bot_token is True
         _, kwargs = mock_app_cls.call_args
         assert kwargs["ignoring_self_events_enabled"] is True
+
+    def test_rate_limited_calls_are_retried(self):
+        """A real client, because the point is what slack_sdk ships by default:
+        one handler, for connection errors. A 429 is not one, so without this the
+        reaction or the menu edit is dropped and only logged."""
+        frontend = SlackFrontend("xapp-tok", "xoxp-tok", "U_SELF")
+        handlers = {type(h).__name__: h for h in frontend._app.client.retry_handlers}
+        assert "AsyncRateLimitErrorRetryHandler" in handlers
+        assert (
+            handlers["AsyncRateLimitErrorRetryHandler"].max_retry_count
+            == RATE_LIMIT_RETRIES
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -607,6 +620,13 @@ class TestNotifyStart:
         await frontend.notify_start(99999)
         frontend._app.client.reactions_add.assert_not_awaited()
         frontend._app.client.reactions_remove.assert_not_awaited()
+
+    async def test_no_pending_is_logged_at_warning(self, frontend, caplog):
+        """A turn that reacts to nothing is the one trace of a dropped :eyes:.
+        At debug it left none, so it could not be told from an API failure."""
+        with caplog.at_level("WARNING", logger="claude_on_the_fly.slack"):
+            await frontend.notify_start(99999)
+        assert "no pending reaction msg for chat_id=99999" in caplog.text
 
 
 class TestNotifyComplete:
@@ -4043,16 +4063,20 @@ class TestSuggestionActions:
         assert status["elements"][0]["text"] == "✓ what can you do?"
         frontend._on_message.assert_awaited_once()
 
-    async def test_tap_without_message_blocks_skips_the_mark(self, frontend):
+    async def test_tap_without_message_blocks_skips_the_mark(self, frontend, caplog):
+        """The one path that dropped the ✓ with no trace. The tap still routes,
+        so this log line is the only evidence the menu was never retired."""
         frontend._sessions[_session_key("C1", "t1")] = ("C1", "t1")
         frontend._app.client.chat_update = AsyncMock()
         body = self._tap()
         del body["message"]["blocks"]
 
-        await frontend._on_suggestion_action(body)
+        with caplog.at_level("WARNING", logger="claude_on_the_fly.slack"):
+            await frontend._on_suggestion_action(body)
 
         frontend._app.client.chat_update.assert_not_awaited()
         frontend._on_message.assert_awaited_once()
+        assert "cannot retire suggestion menu, incomplete payload" in caplog.text
 
     async def test_mark_failure_is_logged_and_tap_still_sends(
         self, frontend, caplog

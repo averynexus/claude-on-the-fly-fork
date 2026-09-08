@@ -22,6 +22,9 @@ import aiohttp
 from slack_bolt.adapter.socket_mode.async_handler import AsyncSocketModeHandler
 from slack_bolt.async_app import AsyncApp
 from slack_sdk.errors import SlackApiError
+from slack_sdk.http_retry.builtin_async_handlers import (
+    AsyncRateLimitErrorRetryHandler,
+)
 from slack_sdk.web.async_slack_response import AsyncSlackResponse
 
 from claude_on_the_fly import checks, logs, settings
@@ -395,6 +398,11 @@ SPINNER_VERBS = (
 # least-recently-active thread is evicted; it re-hydrates from scratch if it
 # ever sees another message. Bounds memory in a long-running daemon.
 DEFAULT_SESSION_CAP = 1000
+# Retries a rate-limited Slack call gets before it gives up. Slack's own
+# Retry-After sets the wait, so this bounds how long one call may block the
+# turn's setup rather than how long it sleeps. Three covers the burst a queue of
+# turns produces; a limit that outlasts three backoffs is an outage, not a burst.
+RATE_LIMIT_RETRIES = 3
 # Seconds of elapsed time between spinner-verb changes. The order is shuffled
 # once per turn (at message-in); ticks just index into it by elapsed time.
 STATUS_VERB_ROTATE_SECS = 4
@@ -1132,6 +1140,15 @@ class SlackFrontend(Frontend):
         self._app = AsyncApp(
             token=token, ignoring_self_events_enabled=self._is_bot_token
         )
+        # slack_sdk ships one default handler, for connection errors. A 429 is
+        # not one: without this, a rate-limited reactions.add or chat_update
+        # raises, gets logged, and the mark simply never appears -- a dropped
+        # :eyes: or a suggestion menu that stays clickable. Both are Tier 3
+        # methods, so a burst of turns can reach the limit. The handler honours
+        # Slack's own Retry-After.
+        self._app.client.retry_handlers.append(
+            AsyncRateLimitErrorRetryHandler(max_retry_count=RATE_LIMIT_RETRIES)
+        )
         self._handler: AsyncSocketModeHandler | None = None
         self._on_message: Callable[[int, str], Awaitable[None]] | None = None
         self._orchestrator: Orchestrator | None = None
@@ -1789,6 +1806,16 @@ class SlackFrontend(Frontend):
         ts = message.get("ts", "")
         blocks = message.get("blocks")
         if not (channel and ts and blocks):
+            # The one path that used to drop the ✓ with no trace anywhere. The
+            # tap still routes, so the only evidence a menu was never retired is
+            # this line.
+            logger.warning(
+                "slack: cannot retire suggestion menu, incomplete payload "
+                "(channel=%r ts=%r blocks=%s)",
+                channel,
+                ts,
+                "yes" if blocks else "no",
+            )
             return
         try:
             await self._app.client.chat_update(
@@ -2958,7 +2985,13 @@ class SlackFrontend(Frontend):
         await self._set_status(chat_id, f"is {seq[0]}…")
         pending = self._pending_msg.get(chat_id)
         if not pending:
-            logger.debug(
+            # Warning, not debug: a slash command and the skill picker reach here
+            # with nothing to react to by design, but so does a typed message
+            # whose entry another turn already took. The two are indistinguishable
+            # from here, and only the second one costs somebody their :eyes:. At
+            # debug it left no trace at all, which is what made a dropped
+            # reaction impossible to tell from a Slack API failure.
+            logger.warning(
                 "notify_start: no pending reaction msg for chat_id=%s", chat_id
             )
             return
